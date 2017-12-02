@@ -1,13 +1,5 @@
 '''
-Tensorflow implementation of Factorization Machines (FM).
-
-The original paper of FM is: Steffen Rendle. Factorization Machines. In Proc. of ICDM 2010.
-
-This version is modified from https://github.com/neural_factorization_machine, which is provided by:
-Xiangnan He (xiangnanhe@gmail.com)
-Lizi Liao (liaolizi.llz@gmail.com)
-
-I need to rewrite it to be adapted to non-sparse data
+Tensorflow implementation of Localized Factorization Machines
 
 '''
 import math
@@ -27,7 +19,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run FM.")
     parser.add_argument('--path', nargs='?', default='data/',
                         help='Input data path.')
-    parser.add_argument('--dataset', nargs='?', default='frappe',
+    parser.add_argument('--dataset', nargs='?', default='banana',
                         help='Choose a dataset.')
     parser.add_argument('--epoch', type=int, default=1000,
                         help='Number of epochs.')
@@ -37,9 +29,11 @@ def parse_args():
                         help='Batch size.')
     parser.add_argument('--hidden_factor', type=int, default=64,
                         help='Number of hidden factors.')
+    parser.add_argument('--anchor_points', type=int, default=10,
+                        help='Number of anchor points')
     parser.add_argument('--regularization_factor', type=float, default=0,
                         help='Regularizer for bilinear part.')
-    parser.add_argument('--keep_prob', type=float, default=0.5,
+    parser.add_argument('--keep_prob', type=float, default=1,
                         help='Keep probility (1-dropout_ratio) for the Bi-Interaction layer. 1: no dropout')
     parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate.')
@@ -55,16 +49,18 @@ def parse_args():
     return parser.parse_args()
 
 
-class FM(BaseEstimator, TransformerMixin):
-    def __init__(self, features_M, pretrain_flag, save_file, hidden_factor, loss_type, epoch, batch_size, learning_rate,
+class LLFM(BaseEstimator, TransformerMixin):
+    def __init__(self, features_M, pretrain_flag, save_file, hidden_factor, anchor_points, loss_type, epoch, batch_size,
+                 learning_rate,
                  lambda_bilinear, keep,
-                 optimizer_type, batch_norm, verbose, random_seed=2016, is_sparse=True):
+                 optimizer_type, batch_norm, verbose, random_seed=2016):
         """
 
         :param features_M: No. of features in the input data
         :param pretrain_flag:
         :param save_file:
         :param hidden_factor:
+        :param anchor_points:
         :param loss_type:
         :param epoch:
         :param batch_size:
@@ -80,6 +76,7 @@ class FM(BaseEstimator, TransformerMixin):
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.hidden_factor = hidden_factor
+        self.anchor_points = anchor_points
         self.save_file = save_file
         self.pretrain_flag = pretrain_flag
         self.loss_type = loss_type
@@ -91,7 +88,6 @@ class FM(BaseEstimator, TransformerMixin):
         self.optimizer_type = optimizer_type
         self.batch_norm = batch_norm
         self.verbose = verbose
-        self.is_sparse = is_sparse
         # performance of each epoch
         self.train_rmse, self.valid_rmse, self.test_rmse = [], [], []
 
@@ -107,10 +103,7 @@ class FM(BaseEstimator, TransformerMixin):
             # Set graph level random seed
             tf.set_random_seed(self.random_seed)
             # Input data.
-            if self.is_sparse:
-                self.train_features = tf.sparse_placeholder(tf.float32, shape=[None, self.features_M])  # None * features_M
-            else:
-                self.train_features = tf.placeholder(tf.float32, shape=[None, self.features_M])  # None * features_M
+            self.train_features = tf.placeholder(tf.float32, shape=[None, self.features_M])  # None * features_M
             self.train_labels = tf.placeholder(tf.float32, shape=[None, 1])  # None * 1
             self.dropout_keep = tf.placeholder(tf.float32)
             self.train_phase = tf.placeholder(tf.bool)
@@ -119,24 +112,42 @@ class FM(BaseEstimator, TransformerMixin):
             self.weights = self._initialize_weights()
 
             # Model.
+
+            # coefficients
+            self.X2 = tf.matmul(tf.reduce_sum(tf.square(self.train_features), 1, keep_dims=True), tf.ones([1, self.anchor_points]))
+            self.Y2 = tf.matmul(tf.ones_like(self.train_labels, dtype=tf.float32),
+                                tf.reduce_sum(tf.square(self.weights['anchor_points']), 0, keep_dims=True))
+            self.XY = tf.matmul(self.train_features, self.weights['anchor_points'])
+            self.distance = self.X2 + self.Y2 - 2 * self.XY
+            self.distance = tf.sqrt(self.distance)
+            self.distance = -10 * self.distance
+            self.coefficient = tf.nn.softmax(self.distance)  # None * A
+            tmp, _ = tf.nn.top_k(self.coefficient, 5, sorted=True)
+            tmp = tmp[:, -1]
+            print(tmp.shape)
+            exit()
+
             # _________ sum_square part _____________
             # get the summed up embeddings of features.
+            # Note: train_features must be a sparse, 0/1 matrix
+            # nonzero_embeddings = tf.nn.embedding_lookup(self.weights['feature_embeddings'], self.train_features)
+            # self.summed_features_emb = tf.reduce_sum(nonzero_embeddings, 1)  # None * K
 
-            if self.is_sparse:
-                self.summed_features_emb = tf.sparse_tensor_dense_matmul(self.train_features, self.weights['feature_embeddings'])  # None * K
-            else:
-                self.summed_features_emb = tf.matmul(self.train_features, self.weights['feature_embeddings'])  # None * K
+            self.weights_reshape = tf.reshape(self.weights['feature_embeddings'], [self.features_M, self.hidden_factor * self.anchor_points])
+
+            self.summed_features_emb = tf.reshape(tf.matmul(self.train_features,
+                                            self.weights_reshape), [-1, self.hidden_factor, self.anchor_points])  # None * K * A
             # get the element-multiplication
-            self.summed_features_emb_square = tf.square(self.summed_features_emb)  # None * K
+            self.summed_features_emb_square = tf.square(self.summed_features_emb)  # None * K * A
 
             # _________ square_sum part _____________
-            if self.is_sparse:
-                self.squared_sum_features_emb = tf.sparse_tensor_dense_matmul(tf.square(self.train_features), tf.square(self.weights['feature_embeddings']))
-            else:
-                self.squared_sum_features_emb = tf.matmul(tf.square(self.train_features), tf.square(self.weights['feature_embeddings']))
+            # self.squared_features_emb = tf.square(nonzero_embeddings)
+            # self.squared_sum_features_emb = tf.reduce_sum(self.squared_features_emb, 1)  # None * K * A
+            self.squared_sum_features_emb = tf.reshape(tf.matmul(tf.square(self.train_features),
+                                                 tf.square(self.weights_reshape)), [-1, self.hidden_factor, self.anchor_points])
 
             # ________ FM __________
-            self.FM = 0.5 * tf.subtract(self.summed_features_emb_square, self.squared_sum_features_emb)  # None * K
+            self.FM = 0.5 * tf.subtract(self.summed_features_emb_square, self.squared_sum_features_emb)  # None * K * A
             if self.batch_norm:
                 self.FM = self.batch_norm_layer(self.FM, train_phase=self.train_phase, scope_bn='bn_fm')
 
@@ -144,18 +155,24 @@ class FM(BaseEstimator, TransformerMixin):
             self.FM = tf.nn.dropout(self.FM, self.dropout_keep)  # dropout at the FM layer
 
             # _________out _________
-            Bilinear = tf.reduce_sum(self.FM, 1, keep_dims=True)  # None * 1
-            if self.is_sparse:
-                self.Feature_bias = tf.sparse_tensor_dense_matmul(self.train_features, self.weights['feature_bias'])
-            else:
-                self.Feature_bias = tf.matmul(self.train_features, self.weights['feature_bias'])
-            Bias = self.weights['bias'] * tf.ones_like(self.train_labels)  # None * 1
-            self.out = tf.add_n([Bilinear, self.Feature_bias, Bias])  # None * 1
+            self.Bilinear = tf.multiply(tf.reduce_sum(self.FM, 1), self.coefficient)  # None * A
+            self.Feature_bias = tf.multiply(tf.matmul(self.train_features, self.weights['feature_bias']), self.coefficient)  # None * A
+            self.Bias = tf.multiply(tf.matmul(tf.ones_like(self.train_labels), self.weights['bias']), self.coefficient)  # None * A
+
+            self.bilinear_reduce = tf.reduce_sum(self.Bilinear, 1)
+            self.feature_bias_reduce = tf.reduce_sum(self.Feature_bias, 1)
+            self.bias_reduce = tf.reduce_sum(self.Bias, 1)
+            print(self.bilinear_reduce.shape)
+            print(self.feature_bias_reduce.shape)
+            print(self.bias_reduce.shape)
+            self.out = tf.add_n([self.bilinear_reduce, self.feature_bias_reduce, self.bias_reduce])  # None * 1
+            self.out = self.out[:, tf.newaxis]
 
             # Compute the loss.
             if self.loss_type == 'square_loss':
                 if self.lambda_bilinear > 0:
-                    self.loss = tf.nn.l2_loss(tf.subtract(self.train_labels, self.out)) + tf.contrib.layers.l2_regularizer(
+                    self.loss = tf.nn.l2_loss(
+                        tf.subtract(self.train_labels, self.out)) + tf.contrib.layers.l2_regularizer(
                         self.lambda_bilinear)(self.weights['feature_embeddings'])  # regulizer
                 else:
                     self.loss = tf.nn.l2_loss(tf.subtract(self.train_labels, self.out))
@@ -163,11 +180,11 @@ class FM(BaseEstimator, TransformerMixin):
                 self.out = tf.sigmoid(self.out)
                 if self.lambda_bilinear > 0:
                     self.loss = tf.losses.log_loss(self.train_labels, self.out, weights=1.0, epsilon=1e-07,
-                                                           scope=None) + tf.contrib.layers.l2_regularizer(
+                                                   scope=None) + tf.contrib.layers.l2_regularizer(
                         self.lambda_bilinear)(self.weights['feature_embeddings'])  # regulizer
                 else:
                     self.loss = tf.losses.log_loss(self.train_labels, self.out, weights=1.0, epsilon=1e-07,
-                                                           scope=None)
+                                                   scope=None)
 
             # Optimizer.
             if self.optimizer_type == 'AdamOptimizer':
@@ -221,11 +238,14 @@ class FM(BaseEstimator, TransformerMixin):
             all_weights['bias'] = tf.Variable(b, dtype=tf.float32)
         else:
             all_weights['feature_embeddings'] = tf.Variable(
-                tf.random_normal([self.features_M, self.hidden_factor], 0.0, 0.01),
-                name='feature_embeddings')  # features_M * K
+                tf.random_normal([self.features_M, self.hidden_factor, self.anchor_points], 0.0, 0.01),
+                name='feature_embeddings')  # features_M * K * A
             all_weights['feature_bias'] = tf.Variable(
-                tf.random_uniform([self.features_M, 1], 0.0, 0.0), name='feature_bias')  # features_M * 1
-            all_weights['bias'] = tf.Variable(tf.constant(0.0), name='bias')  # 1 * 1
+                tf.random_uniform([self.features_M, self.anchor_points], 0.0, 0.0),
+                name='feature_bias')  # features_M * A
+            all_weights['bias'] = tf.Variable(tf.random_uniform([1, self.anchor_points]), name='bias')  # 1 * A
+            all_weights['anchor_points'] = tf.Variable(tf.random_uniform([self.features_M, self.anchor_points]), name='anchor_points')  # M * A
+
         return all_weights
 
     def batch_norm_layer(self, x, train_phase, scope_bn):
@@ -238,15 +258,10 @@ class FM(BaseEstimator, TransformerMixin):
         return z
 
     def partial_fit(self, data):  # fit a batch
-        if self.is_sparse:
-            feed_dict = {self.train_features: sparsify(data['X']), self.train_labels: data['Y'], self.dropout_keep: self.keep,
+        feed_dict = {self.train_features: data['X'], self.train_labels: data['Y'], self.dropout_keep: self.keep,
                      self.train_phase: True}
-        else:
-            feed_dict = {self.train_features: data['X'], self.train_labels: data['Y'], self.dropout_keep: self.keep,
-                         self.train_phase: True}
         loss, opt = self.sess.run((self.loss, self.optimizer), feed_dict=feed_dict)
         return loss
-
 
     def get_random_block_from_data(self, data, batch_size):  # generate a random block of training data
         start_index = np.random.randint(0, data['Y'].shape[0] - batch_size)
@@ -260,7 +275,6 @@ class FM(BaseEstimator, TransformerMixin):
         np.random.shuffle(a)
         np.random.set_state(rng_state)
         np.random.shuffle(b)
-        # pass
 
     def train(self, Train_data, Validation_data, Test_data):  # fit a dataset
         # Check Init performance
@@ -270,7 +284,7 @@ class FM(BaseEstimator, TransformerMixin):
             init_valid = self.evaluate(Validation_data)
             init_test = self.evaluate(Test_data)
             print("Init: \t train=%.4f, validation=%.4f, test=%.4f [%.1f s]" % (
-            init_train, init_valid, init_test, time() - t2))
+                init_train, init_valid, init_test, time() - t2))
 
         for epoch in xrange(self.epoch):
             t1 = time()
@@ -294,8 +308,8 @@ class FM(BaseEstimator, TransformerMixin):
             if self.verbose > 0 and epoch % self.verbose == 0:
                 print("Epoch %d [%.1f s]\ttrain=%.4f, validation=%.4f, test=%.4f [%.1f s]"
                       % (epoch + 1, t2 - t1, train_result, valid_result, test_result, time() - t2))
-            # if self.eva_termination(self.valid_rmse):
-            #     break
+                # if self.eva_termination(self.valid_rmse):
+                #     break
 
         if self.pretrain_flag < 0:
             print "Save model to file as pretrain."
@@ -314,12 +328,8 @@ class FM(BaseEstimator, TransformerMixin):
 
     def evaluate(self, data):  # evaluate the results for an input set
         num_example = data['Y'].shape[0]
-        if self.is_sparse:
-            feed_dict = {self.train_features: data['X_sparse'], self.train_labels: [[y] for y in data['Y']],
+        feed_dict = {self.train_features: data['X'], self.train_labels: [[y] for y in data['Y']],
                      self.dropout_keep: 1.0, self.train_phase: False}
-        else:
-            feed_dict = {self.train_features: data['X'], self.train_labels: [[y] for y in data['Y']],
-                         self.dropout_keep: 1.0, self.train_phase: False}
         predictions = self.sess.run((self.out), feed_dict=feed_dict)
         y_pred = np.reshape(predictions, (num_example,))
         y_true = np.reshape(data['Y'], (num_example,))
@@ -336,53 +346,25 @@ class FM(BaseEstimator, TransformerMixin):
             y_pred = y_pred.astype(dtype=np.int32)
             y_true = y_true.astype(dtype=np.int32)
             return np.sum(y_pred == y_true) / (num_example * 1.0)
-            # return logloss
-
-
-'''         # for testing the classification accuracy  
-            predictions_binary = [] 
-            for item in y_pred:
-                if item > 0.5:
-                    predictions_binary.append(1.0)
-                else:
-                    predictions_binary.append(0.0)
-            Accuracy = accuracy_score(y_true, predictions_binary)
-            return Accuracy '''
-
-
-def sparsify(input_data):
-    data_shape = input_data.shape
-    indices = []
-    values = []
-    for i in range(input_data.shape[0]):
-        for j in range(input_data.shape[1]):
-            if input_data[i, j] >= 0.0001 or input_data[i, j] <= -0.0001:
-                indices.append([i, j])
-                values.append(input_data[i, j])
-
-    return tf.SparseTensorValue(indices, values, data_shape)
 
 
 if __name__ == '__main__':
     # Data loading
     args = parse_args()
-    data = DATA.LoadData(args.path, args.dataset, args.loss_type, False)
-    data.Train_data['X_sparse'] = sparsify(data.Train_data['X'])
-    data.Validation_data['X_sparse'] = sparsify(data.Validation_data['X'])
-    data.Test_data['X_sparse'] = sparsify(data.Test_data['X'])
-
+    data = DATA.LoadData(args.path, args.dataset, args.loss_type, True)
     if args.verbose > 0:
         print(
-        "FM: dataset=%s, factors=%d, loss_type=%s, #epoch=%d, batch=%d, lr=%.4f, lambda=%.1e, keep=%.2f, optimizer=%s, batch_norm=%d"
-        % (args.dataset, args.hidden_factor, args.loss_type, args.epoch, args.batch_size, args.lr,
-           args.regularization_factor, args.keep_prob, args.optimizer, args.batch_norm))
+            "FM: dataset=%s, factors=%d, loss_type=%s, #epoch=%d, batch=%d, lr=%.4f, lambda=%.1e, keep=%.2f, optimizer=%s, batch_norm=%d"
+            % (args.dataset, args.hidden_factor, args.loss_type, args.epoch, args.batch_size, args.lr,
+               args.regularization_factor, args.keep_prob, args.optimizer, args.batch_norm))
 
     save_file = './pretrain/%s_%d/%s_%d' % (args.dataset, args.hidden_factor, args.dataset, args.hidden_factor)
     # Training
     t1 = time()
-    model = FM(data.features_M, args.pretrain, save_file, args.hidden_factor, args.loss_type, args.epoch,
-               args.batch_size, args.lr, args.regularization_factor, args.keep_prob, args.optimizer, args.batch_norm, args.verbose,
-               is_sparse=True)
+    model = LLFM(data.features_M, args.pretrain, save_file, args.hidden_factor, args.anchor_points, args.loss_type,
+                 args.epoch,
+                 args.batch_size, args.lr, args.regularization_factor, args.keep_prob, args.optimizer, args.batch_norm,
+                 args.verbose)
     model.train(data.Train_data, data.Validation_data, data.Test_data)
 
     # Find the best validation result across iterations
