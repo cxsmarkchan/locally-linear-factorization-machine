@@ -11,6 +11,7 @@ import numpy as np
 import random
 import os
 import pickle
+from sparsify import sparse_concat
 
 
 class LoadData(object):
@@ -23,11 +24,12 @@ class LoadData(object):
     '''
 
     # Three files are needed in the path
-    def __init__(self, path, dataset, loss_type, from_file=False):
+    def __init__(self, path, dataset, loss_type, from_file=False, is_sparse=False):
         self.path = path + dataset + "/"
         self.trainfile = self.path + dataset + ".train.libfm"
         self.testfile = self.path + dataset + ".test.libfm"
         self.validationfile = self.path + dataset + ".validation.libfm"
+        self.is_sparse = is_sparse
         if from_file:
             self.Train_data = pickle.load(open(os.path.join(self.path, dataset + '.train.dat')))
             self.Test_data = pickle.load(open(os.path.join(self.path, dataset + '.test.dat')))
@@ -57,25 +59,25 @@ class LoadData(object):
         return features_M, num
 
     def construct_data(self, loss_type):
-        X_, Y_, Y_for_logloss = self.read_data(self.trainfile, self.train_num)
+        X_, Y_, Y_for_logloss, X_sparse_list, X_sparse = self.read_data(self.trainfile, self.train_num)
         if loss_type == 'log_loss':
-            Train_data = self.construct_dataset(X_, Y_for_logloss)
+            Train_data = self.construct_dataset(X_, Y_for_logloss, X_sparse_list, X_sparse)
         else:
-            Train_data = self.construct_dataset(X_, Y_)
+            Train_data = self.construct_dataset(X_, Y_, X_sparse_list, X_sparse)
         print("# of training:", len(Y_))
 
-        X_, Y_, Y_for_logloss = self.read_data(self.validationfile, self.validation_num)
+        X_, Y_, Y_for_logloss, X_sparse_list, X_sparse = self.read_data(self.validationfile, self.validation_num)
         if loss_type == 'log_loss':
-            Validation_data = self.construct_dataset(X_, Y_for_logloss)
+            Validation_data = self.construct_dataset(X_, Y_for_logloss, X_sparse_list, X_sparse)
         else:
-            Validation_data = self.construct_dataset(X_, Y_)
+            Validation_data = self.construct_dataset(X_, Y_, X_sparse_list, X_sparse)
         print("# of validation:", len(Y_))
 
-        X_, Y_, Y_for_logloss = self.read_data(self.testfile, self.test_num)
+        X_, Y_, Y_for_logloss, X_sparse_list, X_sparse = self.read_data(self.testfile, self.test_num)
         if loss_type == 'log_loss':
-            Test_data = self.construct_dataset(X_, Y_for_logloss)
+            Test_data = self.construct_dataset(X_, Y_for_logloss, X_sparse_list, X_sparse)
         else:
-            Test_data = self.construct_dataset(X_, Y_)
+            Test_data = self.construct_dataset(X_, Y_, X_sparse_list, X_sparse)
         print("# of test:", len(Y_))
 
         return Train_data, Validation_data, Test_data
@@ -83,11 +85,17 @@ class LoadData(object):
     def read_data(self, file, data_num):
         # read a data file. For a row, the first column goes into Y_;
         # the other columns become a row in X_ and entries are maped to indexs in self.features
-        X_ = np.zeros([data_num, self.features_M], dtype=np.float32)
+        if not self.is_sparse:
+            X_ = np.zeros([data_num, self.features_M], dtype=np.float32)
+        else:
+            X_ = None
         Y_ = np.zeros([data_num], dtype=np.float32)
+        X_sparse_list = []
         Y_for_logloss = np.zeros([data_num], dtype=np.float32)
         i = 0
         for line in open(file, 'r'):
+            indices = []
+            values = []
             items = line.strip().split(' ')
             Y_[i] = 1.0 * float(items[0])
 
@@ -101,16 +109,24 @@ class LoadData(object):
                 key_value_pair = item.strip().split(':')
                 key = int(key_value_pair[0])
                 value = float(key_value_pair[1])
-                X_[i, key] = float(value)
+                if not self.is_sparse:
+                    X_[i, key] = float(value)
+                indices.append(key)
+                values.append(float(value))
+            X_sparse_list.append({'indices': indices, 'values': values})
 
             i = i + 1
 
-        return X_, Y_, Y_for_logloss
+        X_sparse = sparse_concat(X_sparse_list, self.features_M)
 
-    def construct_dataset(self, X_, Y_):
+        return X_, Y_, Y_for_logloss, X_sparse_list, X_sparse
+
+    def construct_dataset(self, X_, Y_, X_sparse_list, X_sparse):
         Data_Dic = {}
         Data_Dic['Y'] = Y_
         Data_Dic['X'] = X_
+        Data_Dic['X_sparse_list'] = X_sparse_list
+        Data_Dic['X_sparse'] = X_sparse
         return Data_Dic
 
     def truncate_features(self):
