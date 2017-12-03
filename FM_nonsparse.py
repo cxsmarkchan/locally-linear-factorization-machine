@@ -36,7 +36,7 @@ def parse_args():
                         help='flag for pretrain. 1: initialize from pretrain; 0: randomly initialize; -1: save the model to pretrain file')
     parser.add_argument('--batch_size', type=int, default=512,
                         help='Batch size.')
-    parser.add_argument('--hidden_factor', type=int, default=64,
+    parser.add_argument('--hidden_factor', type=int, default=128,
                         help='Number of hidden factors.')
     parser.add_argument('--regularization_factor', type=float, default=0,
                         help='Regularizer for bilinear part.')
@@ -245,12 +245,8 @@ class FM(BaseEstimator, TransformerMixin):
         return z
 
     def partial_fit(self, data):  # fit a batch
-        if self.is_sparse:
-            feed_dict = {self.train_features: data['X'], self.train_labels: data['Y'], self.dropout_keep: self.keep,
-                         self.train_phase: True}
-        else:
-            feed_dict = {self.train_features: data['X'], self.train_labels: data['Y'], self.dropout_keep: self.keep,
-                         self.train_phase: True}
+        feed_dict = {self.train_features: data['X'], self.train_labels: data['Y'], self.dropout_keep: self.keep,
+                     self.train_phase: True}
         loss, opt = self.sess.run((self.loss, self.optimizer), feed_dict=feed_dict)
         return loss
 
@@ -353,12 +349,10 @@ class FM(BaseEstimator, TransformerMixin):
             Accuracy = accuracy_score(y_true, predictions_binary)
             return Accuracy '''
 
-
 if __name__ == '__main__':
     # Data loading
     args = parse_args()
     data = DATA.LoadData(args.path, args.dataset, args.loss_type, False, True)
-    print('yeah')
     if 'X_sparse' not in data.Train_data:
         data.Train_data['X_sparse_list'] = sparsify(data.Train_data['X'])
         data.Train_data['X_sparse'] = sparse_concat(data.Train_data['X_sparse_list'], data.features_M)
@@ -368,9 +362,6 @@ if __name__ == '__main__':
     if 'X_sparse' not in data.Test_data:
         data.Test_data['X_sparse_list'] = sparsify(data.Test_data['X'])
         data.Test_data['X_sparse'] = sparse_concat(data.Test_data['X_sparse_list'], data.features_M)
-    # data.Train_data['X_sparse'] = sparsify_2(data.Train_data['X'])
-    # data.Validation_data['X_sparse'] = sparsify_2(data.Validation_data['X'])
-    # data.Test_data['X_sparse'] = sparsify_2(data.Test_data['X'])
 
     if args.verbose > 0:
         print(

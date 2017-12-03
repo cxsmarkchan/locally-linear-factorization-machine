@@ -11,6 +11,7 @@ from sklearn.metrics import log_loss
 from time import time
 import argparse
 import LoadData_nonsparse as DATA
+from sparsify import sparse_concat, sparsify
 from tensorflow.contrib.layers.python.layers import batch_norm as batch_norm
 
 
@@ -19,25 +20,25 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run FM.")
     parser.add_argument('--path', nargs='?', default='data/',
                         help='Input data path.')
-    parser.add_argument('--dataset', nargs='?', default='banana',
+    parser.add_argument('--dataset', nargs='?', default='frappe',
                         help='Choose a dataset.')
     parser.add_argument('--epoch', type=int, default=1000,
                         help='Number of epochs.')
     parser.add_argument('--pretrain', type=int, default=-1,
                         help='flag for pretrain. 1: initialize from pretrain; 0: randomly initialize; -1: save the model to pretrain file')
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=512,
                         help='Batch size.')
     parser.add_argument('--hidden_factor', type=int, default=64,
                         help='Number of hidden factors.')
-    parser.add_argument('--anchor_points', type=int, default=10,
+    parser.add_argument('--anchor_points', type=int, default=2,
                         help='Number of anchor points')
     parser.add_argument('--regularization_factor', type=float, default=0,
                         help='Regularizer for bilinear part.')
-    parser.add_argument('--keep_prob', type=float, default=1,
+    parser.add_argument('--keep_prob', type=float, default=0.5,
                         help='Keep probility (1-dropout_ratio) for the Bi-Interaction layer. 1: no dropout')
     parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate.')
-    parser.add_argument('--loss_type', nargs='?', default='log_loss',
+    parser.add_argument('--loss_type', nargs='?', default='square_loss',
                         help='Specify a loss type (square_loss or log_loss).')
     parser.add_argument('--optimizer', nargs='?', default='AdamOptimizer',
                         help='Specify an optimizer type (AdamOptimizer, AdagradOptimizer, GradientDescentOptimizer, MomentumOptimizer).')
@@ -53,7 +54,7 @@ class LLFM(BaseEstimator, TransformerMixin):
     def __init__(self, features_M, pretrain_flag, save_file, hidden_factor, anchor_points, loss_type, epoch, batch_size,
                  learning_rate,
                  lambda_bilinear, keep,
-                 optimizer_type, batch_norm, verbose, random_seed=2016):
+                 optimizer_type, batch_norm, verbose, random_seed=2016, is_sparse=True):
         """
 
         :param features_M: No. of features in the input data
@@ -88,6 +89,7 @@ class LLFM(BaseEstimator, TransformerMixin):
         self.optimizer_type = optimizer_type
         self.batch_norm = batch_norm
         self.verbose = verbose
+        self.is_sparse = is_sparse
         # performance of each epoch
         self.train_rmse, self.valid_rmse, self.test_rmse = [], [], []
 
@@ -103,7 +105,11 @@ class LLFM(BaseEstimator, TransformerMixin):
             # Set graph level random seed
             tf.set_random_seed(self.random_seed)
             # Input data.
-            self.train_features = tf.placeholder(tf.float32, shape=[None, self.features_M])  # None * features_M
+            if self.is_sparse:
+                self.train_features = tf.sparse_placeholder(tf.float32,
+                                                            shape=[None, self.features_M])  # None * features_M
+            else:
+                self.train_features = tf.placeholder(tf.float32, shape=[None, self.features_M])  # None * features_M
             self.train_labels = tf.placeholder(tf.float32, shape=[None, 1])  # None * 1
             self.dropout_keep = tf.placeholder(tf.float32)
             self.train_phase = tf.placeholder(tf.bool)
@@ -114,18 +120,14 @@ class LLFM(BaseEstimator, TransformerMixin):
             # Model.
 
             # coefficients
-            self.X2 = tf.matmul(tf.reduce_sum(tf.square(self.train_features), 1, keep_dims=True), tf.ones([1, self.anchor_points]))
+            self.X2 = tf.matmul(tf.sparse_reduce_sum(tf.square(self.train_features), 1, keep_dims=True), tf.ones([1, self.anchor_points]))
             self.Y2 = tf.matmul(tf.ones_like(self.train_labels, dtype=tf.float32),
                                 tf.reduce_sum(tf.square(self.weights['anchor_points']), 0, keep_dims=True))
-            self.XY = tf.matmul(self.train_features, self.weights['anchor_points'])
+            self.XY = tf.sparse_tensor_dense_matmul(self.train_features, self.weights['anchor_points'])
             self.distance = self.X2 + self.Y2 - 2 * self.XY
             self.distance = tf.sqrt(self.distance)
             self.distance = -10 * self.distance
             self.coefficient = tf.nn.softmax(self.distance)  # None * A
-            tmp, _ = tf.nn.top_k(self.coefficient, 5, sorted=True)
-            tmp = tmp[:, -1]
-            print(tmp.shape)
-            exit()
 
             # _________ sum_square part _____________
             # get the summed up embeddings of features.
@@ -135,15 +137,24 @@ class LLFM(BaseEstimator, TransformerMixin):
 
             self.weights_reshape = tf.reshape(self.weights['feature_embeddings'], [self.features_M, self.hidden_factor * self.anchor_points])
 
-            self.summed_features_emb = tf.reshape(tf.matmul(self.train_features,
+            if self.is_sparse:
+                self.summed_features_emb = tf.reshape(tf.sparse_tensor_dense_matmul(self.train_features,
+                                                                self.weights_reshape), [-1, self.hidden_factor, self.anchor_points]) # None * K * A
+            else:
+                self.summed_features_emb = tf.reshape(tf.matmul(self.train_features,
                                             self.weights_reshape), [-1, self.hidden_factor, self.anchor_points])  # None * K * A
+
             # get the element-multiplication
             self.summed_features_emb_square = tf.square(self.summed_features_emb)  # None * K * A
 
             # _________ square_sum part _____________
             # self.squared_features_emb = tf.square(nonzero_embeddings)
             # self.squared_sum_features_emb = tf.reduce_sum(self.squared_features_emb, 1)  # None * K * A
-            self.squared_sum_features_emb = tf.reshape(tf.matmul(tf.square(self.train_features),
+            if self.is_sparse:
+                self.squared_sum_features_emb = tf.reshape(tf.sparse_tensor_dense_matmul(tf.square(self.train_features),
+                                                                     tf.square(self.weights_reshape)), [-1, self.hidden_factor, self.anchor_points])
+            else:
+                self.squared_sum_features_emb = tf.reshape(tf.matmul(tf.square(self.train_features),
                                                  tf.square(self.weights_reshape)), [-1, self.hidden_factor, self.anchor_points])
 
             # ________ FM __________
@@ -156,7 +167,10 @@ class LLFM(BaseEstimator, TransformerMixin):
 
             # _________out _________
             self.Bilinear = tf.multiply(tf.reduce_sum(self.FM, 1), self.coefficient)  # None * A
-            self.Feature_bias = tf.multiply(tf.matmul(self.train_features, self.weights['feature_bias']), self.coefficient)  # None * A
+            if self.is_sparse:
+                self.Feature_bias = tf.multiply(tf.sparse_tensor_dense_matmul(self.train_features, self.weights['feature_bias']), self.coefficient)  # None * A
+            else:
+                self.Feature_bias = tf.multiply(tf.matmul(self.train_features, self.weights['feature_bias']), self.coefficient)  # None * A
             self.Bias = tf.multiply(tf.matmul(tf.ones_like(self.train_labels), self.weights['bias']), self.coefficient)  # None * A
 
             self.bilinear_reduce = tf.reduce_sum(self.Bilinear, 1)
@@ -216,6 +230,7 @@ class LLFM(BaseEstimator, TransformerMixin):
             if self.verbose > 0:
                 print "#params: %d" % total_parameters
 
+
     def _initialize_weights(self):
         """
         feature_embeddings: interaction term, [features_M, K]
@@ -265,16 +280,16 @@ class LLFM(BaseEstimator, TransformerMixin):
 
     def get_random_block_from_data(self, data, batch_size):  # generate a random block of training data
         start_index = np.random.randint(0, data['Y'].shape[0] - batch_size)
-        return {
-            'X': data['X'][start_index:start_index + batch_size, :],
-            'Y': data['Y'][start_index:start_index + batch_size, np.newaxis]
-        }
-
-    def shuffle_in_unison_scary(self, a, b):  # shuffle two lists simutaneously
-        rng_state = np.random.get_state()
-        np.random.shuffle(a)
-        np.random.set_state(rng_state)
-        np.random.shuffle(b)
+        if self.is_sparse:
+            return {
+                'X': sparse_concat(data['X_sparse_list'][start_index:start_index + batch_size], self.features_M),
+                'Y': data['Y'][start_index:start_index + batch_size, np.newaxis]
+            }
+        else:
+            return {
+                'X': data['X'][start_index:start_index + batch_size, :],
+                'Y': data['Y'][start_index:start_index + batch_size, np.newaxis]
+            }
 
     def train(self, Train_data, Validation_data, Test_data):  # fit a dataset
         # Check Init performance
@@ -288,7 +303,6 @@ class LLFM(BaseEstimator, TransformerMixin):
 
         for epoch in xrange(self.epoch):
             t1 = time()
-            self.shuffle_in_unison_scary(Train_data['X'], Train_data['Y'])
             total_batch = int(len(Train_data['Y']) / self.batch_size)
             for i in xrange(total_batch):
                 # generate a batch
@@ -328,8 +342,12 @@ class LLFM(BaseEstimator, TransformerMixin):
 
     def evaluate(self, data):  # evaluate the results for an input set
         num_example = data['Y'].shape[0]
-        feed_dict = {self.train_features: data['X'], self.train_labels: [[y] for y in data['Y']],
-                     self.dropout_keep: 1.0, self.train_phase: False}
+        if self.is_sparse:
+            feed_dict = {self.train_features: data['X_sparse'], self.train_labels: [[y] for y in data['Y']],
+                         self.dropout_keep: 1.0, self.train_phase: False}
+        else:
+            feed_dict = {self.train_features: data['X'], self.train_labels: [[y] for y in data['Y']],
+                         self.dropout_keep: 1.0, self.train_phase: False}
         predictions = self.sess.run((self.out), feed_dict=feed_dict)
         y_pred = np.reshape(predictions, (num_example,))
         y_true = np.reshape(data['Y'], (num_example,))
@@ -351,7 +369,16 @@ class LLFM(BaseEstimator, TransformerMixin):
 if __name__ == '__main__':
     # Data loading
     args = parse_args()
-    data = DATA.LoadData(args.path, args.dataset, args.loss_type, True)
+    data = DATA.LoadData(args.path, args.dataset, args.loss_type, False, True)
+    if 'X_sparse' not in data.Train_data:
+        data.Train_data['X_sparse_list'] = sparsify(data.Train_data['X'])
+        data.Train_data['X_sparse'] = sparse_concat(data.Train_data['X_sparse_list'], data.features_M)
+    if 'X_sparse' not in data.Validation_data:
+        data.Validation_data['X_sparse_list'] = sparsify(data.Validation_data['X'])
+        data.Validation_data['X_sparse'] = sparse_concat(data.Validation_data['X_sparse_list'], data.features_M)
+    if 'X_sparse' not in data.Test_data:
+        data.Test_data['X_sparse_list'] = sparsify(data.Test_data['X'])
+        data.Test_data['X_sparse'] = sparse_concat(data.Test_data['X_sparse_list'], data.features_M)
     if args.verbose > 0:
         print(
             "FM: dataset=%s, factors=%d, loss_type=%s, #epoch=%d, batch=%d, lr=%.4f, lambda=%.1e, keep=%.2f, optimizer=%s, batch_norm=%d"
@@ -364,7 +391,7 @@ if __name__ == '__main__':
     model = LLFM(data.features_M, args.pretrain, save_file, args.hidden_factor, args.anchor_points, args.loss_type,
                  args.epoch,
                  args.batch_size, args.lr, args.regularization_factor, args.keep_prob, args.optimizer, args.batch_norm,
-                 args.verbose)
+                 args.verbose, True)
     model.train(data.Train_data, data.Validation_data, data.Test_data)
 
     # Find the best validation result across iterations
